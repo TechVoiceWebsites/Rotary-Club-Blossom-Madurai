@@ -15,8 +15,6 @@ const ROOT_FOLDER = "Rotary";
 // FOLDER FETCHING (dynamic + recursive + paginated)
 // ======================================================
 
-// Cloudinary returns only 10 folders per call by default.
-// max_results: 500 + next_cursor loop makes sure EVERY folder comes back.
 async function fetchDirectSubFolders(parentPath) {
   let folders = [];
   let nextCursor;
@@ -230,6 +228,47 @@ router.post("/upload", upload.array("photos", 50), async (req, res) => {
   } finally {
     // Always delete temp files so the uploads/ folder doesn't fill up
     await Promise.all(files.map((f) => fs.unlink(f.path).catch(() => {})));
+  }
+});
+
+// ======================================================
+// DELETE /api/images/delete (Delete image from Cloudinary & clear cache)
+// ======================================================
+router.delete('/delete', async(req, res) => {
+  try {
+    const { public_id } = req.body;
+
+    if (!public_id) {
+      return res.status(400).json({
+        success: false,
+        message: 'Public ID is required to delete an image',
+      });
+    }
+
+    // Delete image from Cloudinary
+    const result = await cloudinary.uploader.destroy(public_id);
+
+    if (result.result === 'ok' || result.result === 'not_found') {
+      // Clear the cache so deleted images disappear immediately from the app
+      cache.clear();
+      folderCache = { folders: null, time: 0 };
+
+      return res.json({
+        success: true,
+        message: "Image deleted successfully from Cloudinary and cache cleared!",
+      });
+    } else {
+      return res.status(400).json({
+        success: false,
+        message: "Failed to delete image from Cloudinary",
+      });
+    }
+  } catch (error) {
+    console.error("❌ DELETE ERROR:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
   }
 });
 
