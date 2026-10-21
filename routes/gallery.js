@@ -149,4 +149,49 @@ router.post("/upload", upload.array("images", 50), async (req, res) => {
   }
 });
 
+// ======================================================
+// DELETE GALLERY IMAGE (From Supabase & Cloudinary)
+// ======================================================
+router.delete("/delete", async (req, res) => {
+  try {
+    const { id, public_id } = req.body;
+
+    if (!id && !public_id) {
+      return res.status(400).json({
+        success: false,
+        message: "Image ID or public_id is required",
+      });
+    }
+
+    // 1. Cloudinary-ல் இருந்து டெலீட் செய்ய
+    if (public_id) {
+      await cloudinary.uploader.destroy(public_id);
+    }
+
+    // 2. Supabase டேட்டாபேஸில் இருந்து டெலீட் செய்ய (இப்போது துல்லியமாக ஒப்பிட்டு நீக்கும்)
+    let query = supabase.from("gallery_images").delete();
+    if (id) {
+      query = query.eq("id", id);
+    } else {
+      query = query.or(`cloudinary_public_id.eq.${public_id},image_url.ilike.%${public_id}%`);
+    }
+
+    const { error } = await query;
+
+    if (error) throw error;
+
+    return res.status(200).json({
+      success: true,
+      message: "Image deleted successfully from database and Cloudinary!",
+    });
+  } catch (error) {
+    console.error("Delete error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to delete image",
+      error: error.message,
+    });
+  }
+});
+
 export default router;
