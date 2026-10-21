@@ -201,8 +201,9 @@ router.post("/upload", upload.array("photos", 50), async (req, res) => {
       }
     });
 
-    // Clear image cache so new photos show up immediately
+    // Clear image cache and folder cache so new photos and folders show up immediately instantly
     cache.clear();
+    folderCache = { folders: null, time: 0 };
 
     if (uploadedImages.length === 0) {
       return res.status(500).json({
@@ -249,7 +250,7 @@ router.delete('/delete', async(req, res) => {
     const result = await cloudinary.uploader.destroy(public_id);
 
     if (result.result === 'ok' || result.result === 'not_found') {
-      // Clear the cache so deleted images disappear immediately from the app
+      // Clear the cache so deleted images disappear immediately from the app instantly
       cache.clear();
       folderCache = { folders: null, time: 0 };
 
