@@ -1,19 +1,50 @@
 import express from "express";
+import fs from "fs/promises";
+import { v2 as cloudinary } from "cloudinary";
 import multer from "multer";
-import cloudinary from "../config/cloudinary.js";
-import supabase from "../config/supabase.js";
+import supabase from "../config/supabase.js"; // Supabase client import
 
 const router = express.Router();
 
-// Store uploaded files temporarily in memory using multer
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: {
-    fileSize: 10 * 1024 * 1024, // 10 MB per image
-  },
-});
+// Temporary storage for uploaded files (deleted after Cloudinary upload)
+const upload = multer({ dest: "uploads/" });
 
-// Helper: Folder path-la irunthu Category, Year, Event Date, Event Name dynamic-a pirikka
+// Root folder in Cloudinary that the admin can upload into
+const ROOT_FOLDER = "Rotary";
+
+// ======================================================
+// FOLDER FETCHING (dynamic + recursive + paginated)
+// ======================================================
+
+async function fetchDirectSubFolders(parentPath) {
+  let folders = [];
+  let nextCursor;
+
+  do {
+    const result = await cloudinary.api.sub_folders(parentPath, {
+      max_results: 500,
+      ...(nextCursor ? { next_cursor: nextCursor } : {}),
+    });
+
+    folders = folders.concat(result.folders || []);
+    nextCursor = result.next_cursor;
+  } while (nextCursor);
+
+  return folders;
+}
+
+// Walks the whole tree under parentPath. Sibling branches load in parallel.
+async function getAllSubFolders(parentPath) {
+  const direct = await fetchDirectSubFolders(parentPath);
+
+  const nested = await Promise.all(
+    direct.map((folder) => getAllSubFolders(folder.path))
+  );
+
+  return direct.concat(...nested);
+}
+
+// Helper: Folder path-la irunthu Category, Year, Event Date, Event Name dynamic-a pirikka (Handles Cloudinary (1), (2) duplicate suffixes)
 function parseFolderMetadata(folder, overrides = {}) {
   const pathParts = folder.split("/").filter(Boolean);
   const category = overrides.category || (pathParts.length > 2 ? pathParts[2] : "Events");
@@ -25,7 +56,7 @@ function parseFolderMetadata(folder, overrides = {}) {
 
   const rawFolderName = pathParts[pathParts.length - 1] || "General Event";
 
-  // Date parsing (e.g. "14-nov-2026" or "14-nov-2026_Event Name" or "02-04-oct-2026_RYLA")
+  // Date parsing (e.g. "01-jul-2026(1)" -> handles optional (1), (2) suffixes)
   let event_date = overrides.event_date || null;
   if (!event_date) {
     let parsedDate = new Date().toISOString().split("T")[0];
@@ -45,165 +76,281 @@ function parseFolderMetadata(folder, overrides = {}) {
     event_date = parsedDate;
   }
 
-  // Event name parsing: "14-nov-2026_Diwali Celebration" -> "Diwali Celebration"
+  // Event name parsing: Ignores Cloudinary (1) duplicates like "01-jul-2026(1)_Blood Donation Camp" -> "Blood Donation Camp"
   let event_name = overrides.event_name || null;
   if (!event_name) {
-    const splitByDelimiter = rawFolderName.match(/^\d{1,2}(?:-\d{1,2})?-[a-zA-Z]{3}-20\d{2}[_\-\s]+(.+)$/);
+    const splitByDelimiter = rawFolderName.match(/^\d{1,2}(?:-\d{1,2})?-[a-zA-Z]{3}-20\d{2}(?:\(\d+\))?[_\-\s]+(.+)$/);
     if (splitByDelimiter && splitByDelimiter[1]) {
       event_name = splitByDelimiter[1].trim();
     } else {
-      event_name = rawFolderName.replace(/[-_]/g, " ").replace(/\b\w/g, (l) => l.toUpperCase());
+      event_name = rawFolderName.replace(/\(\d+\)/g, "").replace(/[-_]/g, " ").replace(/\b\w/g, (l) => l.toUpperCase());
     }
   }
 
   return { category, year, event_date, event_name };
 }
 
-// Test route
-router.get("/test", (req, res) => {
-  res.json({
-    success: true,
-    message: "Gallery route working 🚀",
-  });
-});
-
 // ======================================================
-// GET ALL GALLERY IMAGES (Filters: category, year, folder)
+// GET /api/images/folders (NO CACHE - 100% Realtime)
 // ======================================================
-router.get("/", async (req, res) => {
+router.get("/folders", async (req, res) => {
   try {
-    const { category, year, event_name, folder } = req.query;
-
-    let query = supabase
-      .from("gallery_images")
-      .select("*")
-      .order("event_date", { ascending: false });
-
-    if (category) query = query.eq("category", category);
-    if (year) query = query.eq("year", parseInt(year));
-    if (event_name) query = query.ilike("event_name", `%${event_name}%`);
-    if (folder) query = query.ilike("folder", `${folder}%`);
-
-    const { data, error } = await query;
-
-    if (error) throw error;
+    const subFolders = await getAllSubFolders(ROOT_FOLDER);
+    const folders = subFolders.map((f) => ({ name: f.name, path: f.path }));
 
     return res.status(200).json({
       success: true,
-      count: data.length,
-      images: data,
+      cached: false,
+      count: folders.length,
+      folders,
     });
-  } catch (error) {
-    console.error("Fetch error:", error);
+  } catch (err) {
+    console.error("❌ FOLDER FETCH ERROR:", err);
     return res.status(500).json({
       success: false,
-      message: "Failed to fetch gallery images",
-      error: error.message,
+      message: err?.error?.message || err.message || "Failed to fetch folders",
     });
   }
 });
 
 // ======================================================
-// MULTIPLE IMAGE UPLOAD (Parallel + Bulk DB Insert + 100% Dynamic)
+// GET /api/images/grouped?baseFolder=... (100% Dynamic Event Groups)
 // ======================================================
-router.post("/upload", upload.any(), async (req, res) => {
+router.get("/grouped", async (req, res) => {
   try {
-    console.log("📥 Incoming Upload Request Files:", req.files ? req.files.length : 0);
-    console.log("📥 Incoming Body Data:", req.body);
-
-    if (!req.files || req.files.length === 0) {
+    const baseFolder = req.query.baseFolder;
+    if (!baseFolder) {
       return res.status(400).json({
         success: false,
-        message: "No images selected or files missing in request",
+        message: "baseFolder is required",
       });
     }
 
-    const { folder } = req.body;
+    const decodedBase = decodeURIComponent(baseFolder);
+
+    const { data, error } = await supabase
+      .from("gallery_images")
+      .select("*")
+      .ilike("folder", `${decodedBase}%`)
+      .order("event_date", { ascending: false })
+      .order("created_at", { ascending: true });
+
+    if (error) throw error;
+
+    const groupsMap = new Map();
+
+    for (const row of data || []) {
+      const folderPath = row.folder || decodedBase;
+      if (!groupsMap.has(folderPath)) {
+        const subName = folderPath.split("/").pop() || "";
+        let formattedDate = subName;
+        if (row.event_date) {
+          const d = new Date(row.event_date + "T00:00:00");
+          if (!isNaN(d.getTime())) {
+            formattedDate = d.toLocaleDateString("en-GB", {
+              day: "2-digit",
+              month: "short",
+              year: "numeric",
+            });
+          }
+        }
+
+        groupsMap.set(folderPath, {
+          folder: subName,
+          fullFolder: folderPath,
+          rawEventDate: row.event_date || "1970-01-01",
+          date: formattedDate,
+          eventName: row.event_name || subName,
+          images: [],
+        });
+      }
+
+      groupsMap.get(folderPath).images.push({
+        id: row.id,
+        public_id: row.cloudinary_public_id,
+        url: row.image_url,
+        width: row.width,
+        height: row.height,
+        created_at: row.created_at,
+      });
+    }
+
+    const groups = Array.from(groupsMap.values()).sort((a, b) =>
+      b.rawEventDate.localeCompare(a.rawEventDate)
+    );
+
+    return res.json({
+      success: true,
+      groups,
+    });
+  } catch (error) {
+    console.error("❌ GROUPED FETCH ERROR:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+});
+
+// ======================================================
+// GET /api/images?folder=... (INSTANT FETCH FROM SUPABASE DATABASE)
+// ======================================================
+router.get("/", async (req, res) => {
+  try {
+    const folder = req.query.folder;
 
     if (!folder) {
       return res.status(400).json({
         success: false,
-        message: "Folder path is required",
+        message: "Folder name is required",
       });
     }
 
-    // --- FULLY DYNAMIC PARSING FROM FOLDER IF MISSING ---
-    const { category, year, event_date, event_name } = parseFolderMetadata(folder, req.body);
+    const page = Number(req.query.page) || 1;
+    const limit = Number(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
 
-    // Helper function: Cloudinary upload stream
-    const uploadToCloudinary = (fileBuffer) => {
-      return new Promise((resolve, reject) => {
-        const uploadStream = cloudinary.uploader.upload_stream(
-          {
-            folder: folder, // Direct folder path
-            resource_type: "image",
-            transformation: [
-              {
-                quality: "auto",
-                fetch_format: "auto",
-              },
-            ],
-          },
-          (error, result) => {
-            if (error) reject(error);
-            else resolve(result);
-          }
-        );
-        uploadStream.end(fileBuffer);
-      });
-    };
+    const decodedFolder = decodeURIComponent(folder);
 
-    // 1. Upload all images to Cloudinary concurrently
-    const uploadResults = await Promise.all(
-      req.files.map((file) => uploadToCloudinary(file.buffer))
-    );
+    const { data, error, count } = await supabase
+      .from("gallery_images")
+      .select("*", { count: "exact" })
+      .ilike("folder", `%${decodedFolder}%`)
+      .order("created_at", { ascending: false })
+      .range(offset, offset + limit - 1);
 
-    // 2. Prepare payload for single bulk database insert
-    const dbPayload = uploadResults.map((result, index) => ({
-      category,
-      year: Number(year),
-      event_date,
-      event_name,
-      folder,
-      cloudinary_public_id: result.public_id,
-      image_url: result.secure_url,
-      width: result.width,
-      height: result.height,
-      sort_order: index,
+    if (error) {
+      throw error;
+    }
+
+    const images = (data || []).map((img) => ({
+      id: img.id,
+      public_id: img.cloudinary_public_id,
+      url: img.image_url,
+      width: img.width,
+      height: img.height,
+      created_at: img.created_at,
     }));
 
-    // 3. Insert all records in one Supabase query
-    const { data, error: dbError } = await supabase
-      .from("gallery_images")
-      .insert(dbPayload)
-      .select();
+    const total = count || images.length;
 
-    if (dbError) {
-      console.error("❌ Supabase insert error:", dbError);
-      return res.status(500).json({
-        success: false,
-        message: "Images uploaded to Cloudinary, but database record failed",
-        error: dbError.message,
-      });
-    }
-
-    return res.status(201).json({
+    return res.json({
       success: true,
-      message: `${data.length} image(s) uploaded successfully to Cloudinary & Database!`,
-      images: data,
+      images,
+      total,
+      page,
+      limit,
+      hasMore: offset + images.length < total,
     });
   } catch (error) {
-    console.error("❌ Gallery upload error:", error);
+    console.error("❌ SUPABASE FETCH ERROR:", error);
     return res.status(500).json({
       success: false,
-      message: "Image upload failed",
-      error: error.message,
+      message: error.message,
     });
   }
 });
 
 // ======================================================
-// SYNC CLOUDINARY FOLDER TO SUPABASE (No Duplicates + Subfolder Support)
+// POST /api/images/upload (Cloudinary Upload + Supabase Instant Insert)
+// ======================================================
+router.post("/upload", upload.any(), async (req, res) => {
+  const files = req.files || [];
+
+  try {
+    const folder = req.body.folder;
+
+    if (!folder) {
+      return res.status(400).json({
+        success: false,
+        message: "Folder name is required for upload",
+      });
+    }
+
+    if (files.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "No files uploaded",
+      });
+    }
+
+    const meta = parseFolderMetadata(folder, req.body);
+
+    const results = await Promise.allSettled(
+      files.map((file) =>
+        cloudinary.uploader.upload(file.path, {
+          folder,
+          resource_type: "image",
+        })
+      )
+    );
+
+    const uploadedImages = [];
+    let failedCount = 0;
+
+    for (const r of results) {
+      if (r.status === "fulfilled") {
+        const cloudResult = r.value;
+        const imageData = {
+          folder: folder,
+          category: meta.category,
+          year: meta.year,
+          event_name: meta.event_name,
+          event_date: meta.event_date,
+          cloudinary_public_id: cloudResult.public_id,
+          image_url: cloudResult.secure_url,
+          width: cloudResult.width,
+          height: cloudResult.height,
+        };
+
+        const { data: dbData, error: dbError } = await supabase
+          .from("gallery_images")
+          .insert([imageData])
+          .select();
+
+        if (dbError) {
+          console.error("❌ Supabase insert error during upload:", dbError);
+        } else if (dbData && dbData.length > 0) {
+          uploadedImages.push({
+            id: dbData[0].id,
+            public_id: cloudResult.public_id,
+            url: cloudResult.secure_url,
+          });
+        }
+      } else {
+        failedCount++;
+        console.error("❌ One file failed:", r.reason?.message || r.reason);
+      }
+    }
+
+    if (uploadedImages.length === 0) {
+      return res.status(500).json({
+        success: false,
+        message: "All uploads failed. Check backend console.",
+      });
+    }
+
+    return res.json({
+      success: true,
+      message:
+        failedCount > 0
+          ? `${uploadedImages.length} photos uploaded, ${failedCount} failed.`
+          : `${uploadedImages.length} photos uploaded successfully to Database & Cloudinary!`,
+      images: uploadedImages,
+    });
+  } catch (error) {
+    console.error("❌ UPLOAD ERROR:", error);
+    return res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  } finally {
+    await Promise.all(files.map((f) => fs.unlink(f.path).catch(() => {})));
+  }
+});
+
+// ======================================================
+// POST /api/images/sync (Auto-updates renamed Event Names & handles (1) suffixes)
 // ======================================================
 router.post("/sync", async (req, res) => {
   try {
@@ -216,7 +363,6 @@ router.post("/sync", async (req, res) => {
       });
     }
 
-    // 1. Cloudinary-la irunthu antha folder + subfolders-oda ella images-aiyum edukka
     const cloudinaryRes = await cloudinary.search
       .expression(`(folder:"${folder}/*" OR folder:"${folder}") AND resource_type:image`)
       .sort_by("public_id", "asc")
@@ -231,7 +377,22 @@ router.post("/sync", async (req, res) => {
       });
     }
 
-    // 2. Supabase-la already irukura public_id-galai check panna (Duplicate thavirkka)
+    // 🚀 AUTO-UPDATE RENAMED FOLDERS/EVENT NAMES IN SUPABASE
+    for (const item of resources) {
+      const itemFolder = item.asset_folder || item.folder || item.public_id.split("/").slice(0, -1).join("/") || folder;
+      const meta = parseFolderMetadata(itemFolder, req.body);
+
+      await supabase
+        .from("gallery_images")
+        .update({
+          event_name: meta.event_name,
+          event_date: meta.event_date,
+          category: meta.category,
+          year: meta.year,
+        })
+        .eq("cloudinary_public_id", item.public_id);
+    }
+
     const { data: existingRows, error: fetchError } = await supabase
       .from("gallery_images")
       .select("cloudinary_public_id")
@@ -243,7 +404,6 @@ router.post("/sync", async (req, res) => {
       (existingRows || []).map((row) => row.cloudinary_public_id)
     );
 
-    // Puthu images-a mattum filter panna
     const newResources = resources.filter(
       (item) => !existingIds.has(item.public_id)
     );
@@ -251,28 +411,26 @@ router.post("/sync", async (req, res) => {
     if (newResources.length === 0) {
       return res.status(200).json({
         success: true,
-        message: "All Cloudinary images are already synced with Supabase!",
+        message: "Folder synced! All event names & images are up to date.",
         syncedCount: 0,
       });
     }
 
-    // 3. Dynamic parsing & Supabase-la insert panna payload ready panna
     const dbPayload = newResources.map((item, index) => {
       const itemFolder =
         item.asset_folder || item.folder || item.public_id.split("/").slice(0, -1).join("/") || folder;
       const meta = parseFolderMetadata(itemFolder, req.body);
 
       return {
+        folder: itemFolder,
         category: meta.category,
         year: meta.year,
-        event_date: meta.event_date,
         event_name: meta.event_name,
-        folder: itemFolder,
+        event_date: meta.event_date,
         cloudinary_public_id: item.public_id,
         image_url: item.secure_url,
         width: item.width,
         height: item.height,
-        sort_order: existingIds.size + index,
       };
     });
 
@@ -285,103 +443,32 @@ router.post("/sync", async (req, res) => {
 
     return res.status(201).json({
       success: true,
-      message: `${insertedData.length} new image(s) synced to Supabase!`,
+      message: `${insertedData.length} new image(s) and metadata synced successfully!`,
       syncedCount: insertedData.length,
-      images: insertedData,
     });
   } catch (error) {
-    console.error("❌ Cloudinary Sync Error:", error);
+    console.error("❌ SYNC ERROR:", error);
     return res.status(500).json({
       success: false,
-      message: "Sync failed",
-      error: error.message,
+      message: error.message,
     });
   }
 });
 
 // ======================================================
-// CLOUDINARY WEBHOOK (100% Auto-Sync on Direct Dashboard Upload / Delete)
+// DELETE /api/images/delete (Delete image from Cloudinary & Supabase Database)
 // ======================================================
-router.post("/webhook", async (req, res) => {
-  try {
-    const payload = req.body;
-    console.log("🔔 Cloudinary Webhook Received:", payload?.notification_type);
-
-    // 1. Photo Upload aanaal (notification_type === 'upload')
-    if (payload?.notification_type === "upload" && payload?.public_id) {
-      const publicId = payload.public_id;
-      const folder = payload.asset_folder || payload.folder || publicId.split("/").slice(0, -1).join("/");
-
-      if (!folder.startsWith("Rotary")) {
-        return res.status(200).json({ success: true, ignored: true });
-      }
-
-      const { data: existing } = await supabase
-        .from("gallery_images")
-        .select("id")
-        .eq("cloudinary_public_id", publicId)
-        .maybeSingle();
-
-      if (existing) {
-        return res.status(200).json({ success: true, message: "Already exists in DB" });
-      }
-
-      const { category, year, event_date, event_name } = parseFolderMetadata(folder);
-
-      const { error: insertError } = await supabase.from("gallery_images").insert([
-        {
-          category,
-          year,
-          event_date,
-          event_name,
-          folder,
-          cloudinary_public_id: publicId,
-          image_url: payload.secure_url,
-          width: payload.width,
-          height: payload.height,
-        },
-      ]);
-
-      if (insertError) throw insertError;
-      console.log(`✅ Auto-synced from Cloudinary Webhook: ${publicId}`);
-    }
-
-    // 2. Cloudinary Dashboard-la Delete pannaal Supabase-layum delete aagum
-    if (payload?.notification_type === "delete" && Array.isArray(payload?.resources)) {
-      const publicIds = payload.resources.map((r) => r.public_id).filter(Boolean);
-      if (publicIds.length > 0) {
-        await supabase
-          .from("gallery_images")
-          .delete()
-          .in("cloudinary_public_id", publicIds);
-        console.log(`🗑️ Auto-deleted from Supabase via Webhook:`, publicIds);
-      }
-    }
-
-    return res.status(200).json({ success: true });
-  } catch (error) {
-    console.error("❌ Webhook Error:", error);
-    return res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// ======================================================
-// DELETE GALLERY IMAGE (From Supabase & Cloudinary)
-// ======================================================
-router.delete("/delete", async (req, res) => {
+router.delete('/delete', async (req, res) => {
   try {
     const { id, public_id } = req.body;
-
-    console.log("🗑️ Delete Request Received for ID/Public_ID:", id || public_id);
 
     if (!id && !public_id) {
       return res.status(400).json({
         success: false,
-        message: "Image ID or public_id is required",
+        message: 'Image ID or public_id is required to delete an image',
       });
     }
 
-    // 1. Supabase டேட்டாபேஸில் இருந்து பாதுகாப்பாக டெலீட் செய்ய (Service Role Key மூலம் Row நீக்கப்படும்)
     let query = supabase.from("gallery_images").delete();
     if (id) {
       query = query.eq("id", id);
@@ -389,31 +476,26 @@ router.delete("/delete", async (req, res) => {
       query = query.eq("cloudinary_public_id", public_id);
     }
 
-    const { data: deletedData, error: dbError } = await query.select();
+    const { error: dbError } = await query;
 
     if (dbError) {
       console.error("❌ Supabase delete error:", dbError);
-      throw dbError;
     }
 
-    console.log("✅ Supabase deleted rows:", deletedData);
-
-    // 2. Cloudinary-ல் இருந்து டெலீட் செய்ய
     if (public_id) {
-      const cloudinaryResult = await cloudinary.uploader.destroy(public_id);
-      console.log("☁️ Cloudinary destroy result:", cloudinaryResult);
+      const result = await cloudinary.uploader.destroy(public_id);
+      console.log("☁️ Cloudinary destroy result:", result);
     }
 
-    return res.status(200).json({
+    return res.json({
       success: true,
-      message: "Image deleted successfully from database and Cloudinary!",
+      message: "Image deleted successfully from Cloudinary and Database!",
     });
   } catch (error) {
-    console.error("❌ Delete error:", error);
+    console.error("❌ DELETE ERROR:", error);
     return res.status(500).json({
       success: false,
-      message: "Failed to delete image",
-      error: error.message,
+      message: error.message,
     });
   }
 });
