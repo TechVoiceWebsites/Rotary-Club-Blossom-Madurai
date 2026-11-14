@@ -8,7 +8,6 @@ import galleryRoutes from "./routes/gallery.js";
 
 const app = express();
 
-
 // MIDDLEWARE
 app.use(
   cors({
@@ -18,7 +17,6 @@ app.use(
 );
 
 app.use(express.json());
-
 
 // CLOUDINARY CONFIG
 cloudinary.config({
@@ -94,7 +92,6 @@ app.use((req, res) => {
 const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, () => {
-
   console.log("\n=================================");
   console.log(
     `🚀 Server running: http://localhost:${PORT}`
@@ -102,6 +99,8 @@ app.listen(PORT, () => {
   console.log(
     `📸 Image API: http://localhost:${PORT}/api/images`
   );
+  console.log(
+    `🖼️ Gallery API: http://localhost:${PORT}/api/gallery`
+  );
   console.log("=================================\n");
-
 });
